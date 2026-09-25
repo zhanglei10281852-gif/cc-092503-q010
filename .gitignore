@@ -7,3 +7,8 @@ __pycache__/
 .pytest_cache/
 data/*.db
 data/*.db-*
+
+# 构建产物
+*.egg-info/
+build/
+dist/

@@ -190,6 +190,8 @@ CREATE TABLE IF NOT EXISTS samples (
     location_id INTEGER REFERENCES storage_locations(id),
     custody_user_id INTEGER REFERENCES users(id),
     lineage_depth INTEGER NOT NULL DEFAULT 0,
+    contamination_lock INTEGER REFERENCES contamination_events(id),
+    pre_freeze_state TEXT,
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -244,7 +246,7 @@ CREATE TABLE IF NOT EXISTS consumption_records (
 CREATE TABLE IF NOT EXISTS approval_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_code TEXT NOT NULL UNIQUE,
-    action_type TEXT NOT NULL CHECK(action_type IN ('loan','destruction','location_reveal','inventory_adjustment')),
+    action_type TEXT NOT NULL CHECK(action_type IN ('loan','destruction','location_reveal','inventory_adjustment','contamination_release')),
     resource_type TEXT NOT NULL,
     resource_id INTEGER NOT NULL,
     requested_by INTEGER NOT NULL REFERENCES users(id),
@@ -335,6 +337,74 @@ CREATE TABLE IF NOT EXISTS sample_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sample_events_sample ON sample_events(sample_id, id);
+
+CREATE TABLE IF NOT EXISTS contamination_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_code TEXT NOT NULL UNIQUE,
+    source_sample_id INTEGER NOT NULL REFERENCES samples(id),
+    source_sample_version INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('low','medium','high','critical')),
+    state TEXT NOT NULL CHECK(state IN ('containing','contained','released','cancelled')),
+    lineage_generation INTEGER NOT NULL DEFAULT 0,
+    lineage_signature TEXT NOT NULL DEFAULT '',
+    containment_round INTEGER NOT NULL DEFAULT 0,
+    last_change_detected_at TEXT,
+    recalculation_count INTEGER NOT NULL DEFAULT 0,
+    reported_by INTEGER NOT NULL REFERENCES users(id),
+    investigation_conclusion TEXT,
+    investigation_recorded_by INTEGER REFERENCES users(id),
+    investigation_recorded_at TEXT,
+    release_approval_id INTEGER REFERENCES approval_requests(id),
+    released_by INTEGER REFERENCES users(id),
+    released_at TEXT,
+    report_json TEXT,
+    report_generated_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS containment_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES contamination_events(id) ON DELETE CASCADE,
+    lineage_generation INTEGER NOT NULL,
+    object_type TEXT NOT NULL CHECK(object_type IN ('sample','loan','consumption','destruction')),
+    object_id INTEGER NOT NULL,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    disposition TEXT NOT NULL CHECK(disposition IN ('frozen','recalled','irreversible','excluded')),
+    status TEXT NOT NULL CHECK(status IN ('pending','applied','skipped','excluded')),
+    applied_at TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    inclusion_reason TEXT NOT NULL,
+    exclusion_reason TEXT,
+    first_seen_generation INTEGER NOT NULL,
+    last_seen_generation INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(event_id, object_type, object_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_containment_event ON containment_actions(event_id);
+CREATE INDEX IF NOT EXISTS idx_containment_sample ON containment_actions(sample_id);
+
+CREATE TABLE IF NOT EXISTS recall_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL REFERENCES contamination_events(id) ON DELETE CASCADE,
+    loan_id INTEGER NOT NULL REFERENCES loans(id),
+    borrower_user_id INTEGER NOT NULL REFERENCES users(id),
+    channel TEXT NOT NULL CHECK(channel IN ('in_system','email','phone')),
+    recipient TEXT NOT NULL,
+    content TEXT NOT NULL,
+    dedup_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN ('queued','sent','cancelled')),
+    sent_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recall_event ON recall_notifications(event_id);
+CREATE INDEX IF NOT EXISTS idx_recall_loan ON recall_notifications(loan_id);
 """
 
 PERMISSIONS = [
@@ -353,6 +423,8 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("locations.read_sensitive", "查看精确保管位置", "locations", "read_sensitive"),
     ("anomalies.manage", "管理异常", "anomalies", "manage"),
+    ("contamination.manage", "处置污染影响与召回", "contamination", "manage"),
+    ("contamination.release", "审批解除污染控制", "contamination", "release"),
 ]
 
 
@@ -401,10 +473,51 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_columns(connection: sqlite3.Connection) -> None:
+    """为已存在的库补充后期新增列与约束（SQLite 无法在 CREATE TABLE IF NOT EXISTS 中改表）。"""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(samples)").fetchall()}
+    if "contamination_lock" not in columns:
+        connection.execute("ALTER TABLE samples ADD COLUMN contamination_lock INTEGER REFERENCES contamination_events(id)")
+    if "pre_freeze_state" not in columns:
+        connection.execute("ALTER TABLE samples ADD COLUMN pre_freeze_state TEXT")
+    # approval_requests 的 CHECK 需要扩展 contamination_release，SQLite 只能整表重建
+    definition = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_requests'"
+    ).fetchone()
+    if definition is not None and "contamination_release" not in definition[0]:
+        fk_was_on = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.executescript(
+            """
+            CREATE TABLE approval_requests_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_code TEXT NOT NULL UNIQUE,
+                action_type TEXT NOT NULL CHECK(action_type IN ('loan','destruction','location_reveal','inventory_adjustment','contamination_release')),
+                resource_type TEXT NOT NULL,
+                resource_id INTEGER NOT NULL,
+                requested_by INTEGER NOT NULL REFERENCES users(id),
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','cancelled','expired','executed')),
+                required_approvals INTEGER NOT NULL DEFAULT 2 CHECK(required_approvals >= 2),
+                expires_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO approval_requests_new SELECT * FROM approval_requests;
+            DROP TABLE approval_requests;
+            ALTER TABLE approval_requests_new RENAME TO approval_requests;
+            """
+        )
+        if fk_was_on:
+            connection.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _ensure_columns(connection)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
@@ -431,10 +544,10 @@ def init_db() -> None:
         role_permissions = {
             "sample_manager": [
                 "samples.read", "samples.write", "samples.consume", "samples.destroy",
-                "loans.manage", "inventory.manage", "anomalies.manage",
+                "loans.manage", "inventory.manage", "anomalies.manage", "contamination.manage",
             ],
             "researcher": ["samples.read", "samples.consume"],
-            "approver": ["samples.read", "approvals.decide"],
+            "approver": ["samples.read", "approvals.decide", "contamination.release"],
             "auditor": ["samples.read", "audit.read"],
         }
         for role_code, permission_codes in role_permissions.items():

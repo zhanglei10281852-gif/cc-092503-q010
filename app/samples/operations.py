@@ -78,6 +78,8 @@ class TransferService:
     def move(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         before = self.samples.get(sample_id)
+        if before.get("contamination_lock") is not None:
+            raise ConflictError("样品处于污染管控中，禁止转移保管位置")
         target = self.locations.get(data["location_id"])
         if before["lifecycle_state"] in {"loaned", "pending_destruction", "destroyed"}:
             raise ConflictError("当前状态禁止转移保管位置")
@@ -141,6 +143,8 @@ class DestructionService:
         if existing:
             return {"record": dict(existing), "sample": self.samples.get(approval["resource_id"]), "replayed": True}
         sample = self.samples.get(approval["resource_id"])
+        if sample.get("contamination_lock") is not None:
+            raise ConflictError("样品处于污染管控中，须先完成调查并解除控制才能销毁")
         quantity = float(approval["payload"].get("quantity", sample["quantity"]))
         if quantity <= 0 or quantity > sample["quantity"] - sample["reserved_quantity"]:
             raise ConflictError("审批数量超过当前可销毁数量")

@@ -106,6 +106,8 @@ class SampleLifecycleService:
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         parent = self.samples.get(sample_id)
+        if parent.get("contamination_lock") is not None:
+            raise ConflictError("样品处于污染管控中，禁止继续分装")
         total = round(sum(item["quantity"] for item in data["children"]) + data.get("loss_quantity", 0), 9)
         if abs(total - data["requested_quantity"]) > 1e-6:
             raise ValidationError("子样数量与损耗之和必须等于分装数量")
@@ -149,6 +151,8 @@ class SampleLifecycleService:
         sample = self.samples.get(sample_id)
         if sample["lifecycle_state"] in {"destroyed", "pending_destruction", "quarantined"}:
             raise ConflictError("当前状态禁止消耗")
+        if sample.get("contamination_lock") is not None:
+            raise ConflictError("样品处于污染召回管控中，禁止继续消耗")
         existing = self.connection.execute(
             "SELECT * FROM consumption_records WHERE sample_id=? AND idempotency_key=?",
             (sample_id, data["idempotency_key"]),
@@ -182,6 +186,8 @@ class LoanService:
     def create(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("loans.manage")
         sample = self.samples.get(data["sample_id"])
+        if sample.get("contamination_lock") is not None:
+            raise ConflictError("样品处于污染管控中，禁止新的借用")
         if sample["lifecycle_state"] not in {"available", "partially_consumed"}:
             raise ConflictError("样品当前不可借用")
         if sample["quantity"] - sample["reserved_quantity"] < data["quantity"]:
@@ -220,11 +226,19 @@ class LoanService:
             "UPDATE loans SET returned_quantity=?,state=?,version=version+1,updated_at=? WHERE id=?",
             (returned, state, now, loan_id),
         )
+        sample_row = self.connection.execute("SELECT * FROM samples WHERE id=?", (loan["sample_id"],)).fetchone()
+        locked = dict(sample_row)["contamination_lock"] if sample_row else None
+        if locked:
+            state_sql = "lifecycle_state='quarantined'"
+            state_params: list = []
+        else:
+            state_sql = """lifecycle_state=CASE WHEN reserved_quantity-?=0 THEN CASE WHEN quantity=0 THEN 'consumed' ELSE 'available' END ELSE 'loaned' END"""
+            state_params = [data["quantity"]]
         self.connection.execute(
-            """UPDATE samples SET reserved_quantity=reserved_quantity-?,
-               lifecycle_state=CASE WHEN reserved_quantity-?=0 THEN CASE WHEN quantity=0 THEN 'consumed' ELSE 'available' END ELSE 'loaned' END,
+            f"""UPDATE samples SET reserved_quantity=reserved_quantity-?,
+               {state_sql},
                version=version+1,updated_at=? WHERE id=?""",
-            (data["quantity"], data["quantity"], now, loan["sample_id"]),
+            (data["quantity"], *state_params, now, loan["sample_id"]),
         )
         result = dict(self.connection.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
         self.samples.append_event(loan["sample_id"], "returned", principal.user_id, now, quantity_delta=0, details={"loan_id": loan_id, "returned_quantity": data["quantity"]})
@@ -257,6 +271,8 @@ class ApprovalService:
     def decide(self, principal: Principal, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("approvals.decide")
         before = self.approvals.get(request_id)
+        if before["action_type"] == "contamination_release":
+            raise ConflictError("污染解除审批必须通过 /api/contamination/release-requests 专用端点决定")
         result = self.approvals.decide(request_id, principal.user_id, data["decision"], data.get("comment", ""), to_storage(self.clock.now()))
         self.audit.record(principal, "approval.decide", "approval_request", str(request_id), before=before, after=result)
         return result

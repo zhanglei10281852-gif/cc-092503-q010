@@ -11,6 +11,7 @@ from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.samples.repository import AnomalyRepository, ApprovalRepository, BatchRepository, LocationRepository, SampleRepository
+from app.samples.recall import assert_sample_not_controlled
 from app.services.audit import AuditService
 
 
@@ -106,6 +107,7 @@ class SampleLifecycleService:
     def aliquot(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         parent = self.samples.get(sample_id)
+        assert_sample_not_controlled(parent)
         total = round(sum(item["quantity"] for item in data["children"]) + data.get("loss_quantity", 0), 9)
         if abs(total - data["requested_quantity"]) > 1e-6:
             raise ValidationError("子样数量与损耗之和必须等于分装数量")
@@ -147,6 +149,7 @@ class SampleLifecycleService:
     def consume(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.consume")
         sample = self.samples.get(sample_id)
+        assert_sample_not_controlled(sample)
         if sample["lifecycle_state"] in {"destroyed", "pending_destruction", "quarantined"}:
             raise ConflictError("当前状态禁止消耗")
         existing = self.connection.execute(
@@ -182,6 +185,7 @@ class LoanService:
     def create(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("loans.manage")
         sample = self.samples.get(data["sample_id"])
+        assert_sample_not_controlled(sample)
         if sample["lifecycle_state"] not in {"available", "partially_consumed"}:
             raise ConflictError("样品当前不可借用")
         if sample["quantity"] - sample["reserved_quantity"] < data["quantity"]:
@@ -227,6 +231,22 @@ class LoanService:
             (data["quantity"], data["quantity"], now, loan["sample_id"]),
         )
         result = dict(self.connection.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
+        returned_sample = self.samples.get(loan["sample_id"])
+        # 污染控制中的样品归还入库后必须继续隔离，不能直接恢复可动用状态。
+        if returned_sample.get("control_case_id") and state == "returned":
+            if returned_sample["quantity"] > 0 and returned_sample["lifecycle_state"] != "quarantined":
+                held = self.samples.set_state(loan["sample_id"], "quarantined", returned_sample["version"], now)
+                self.samples.append_event(
+                    loan["sample_id"], "containment.frozen", principal.user_id, now,
+                    from_state=returned_sample["lifecycle_state"], to_state="quarantined",
+                    details={"case_id": returned_sample["control_case_id"], "loan_id": loan_id, "returned_under_recall": True},
+                )
+                returned_sample = held
+            self.connection.execute(
+                "UPDATE loans SET recall_case_id=NULL,version=version+1,updated_at=? WHERE id=?",
+                (now, loan_id),
+            )
+            result = dict(self.connection.execute("SELECT * FROM loans WHERE id=?", (loan_id,)).fetchone())
         self.samples.append_event(loan["sample_id"], "returned", principal.user_id, now, quantity_delta=0, details={"loan_id": loan_id, "returned_quantity": data["quantity"]})
         self.audit.record(principal, "loan.return", "loan", str(loan_id), before=loan, after=result)
         return result

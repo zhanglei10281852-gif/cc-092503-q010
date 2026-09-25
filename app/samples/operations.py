@@ -10,6 +10,7 @@ from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.samples.repository import ApprovalRepository, LocationRepository, SampleRepository
+from app.samples.recall import assert_sample_not_controlled
 from app.services.audit import AuditService
 
 
@@ -78,6 +79,7 @@ class TransferService:
     def move(self, principal: Principal, sample_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("samples.write")
         before = self.samples.get(sample_id)
+        assert_sample_not_controlled(before)
         target = self.locations.get(data["location_id"])
         if before["lifecycle_state"] in {"loaned", "pending_destruction", "destroyed"}:
             raise ConflictError("当前状态禁止转移保管位置")
@@ -141,6 +143,7 @@ class DestructionService:
         if existing:
             return {"record": dict(existing), "sample": self.samples.get(approval["resource_id"]), "replayed": True}
         sample = self.samples.get(approval["resource_id"])
+        assert_sample_not_controlled(sample)
         quantity = float(approval["payload"].get("quantity", sample["quantity"]))
         if quantity <= 0 or quantity > sample["quantity"] - sample["reserved_quantity"]:
             raise ConflictError("审批数量超过当前可销毁数量")
